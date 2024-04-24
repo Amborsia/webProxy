@@ -1,231 +1,365 @@
-/* $begin tinymain */
-/*
- * tiny.c - A simple, iterative HTTP/1.0 Web server that uses the
- *     GET method to serve static and dynamic content.
- *
- * Updated 11/2019 droh
- *   - Fixed sprintf() aliasing issue in serve_static(), and clienterror().
- */
+#include <stdio.h>
 #include "csapp.h"
 
-void doit(int fd);
-void read_requesthdrs(rio_t *rp);
-int parse_uri(char *uri, char *filename, char *cgiargs);
-void serve_static(int fd, char *filename, int filesize);
-void get_filetype(char *filename, char *filetype);
-void serve_dynamic(int fd, char *filename, char *cgiargs);
-void clienterror(int fd, char *cause, char *errnum, char *shortmsg,
-                 char *longmsg);
+/* Recommended max cache and object sizes */
+#define MAX_CACHE_SIZE 1049000
+#define MAX_OBJECT_SIZE 102400
+#define LRU_MAGIC_NUMBER 9999
+#define N 4
+#define CACHE_OBJS_COUNT 10
 
+/* User-Agent 헤더 */
+static const char *user_agent_hdr =
+    "User-Agent: Mozilla/5.0 (X11; Linux x86_64; rv:10.0.3) Gecko/20120305 "
+    "Firefox/10.0.3\r\n";
+
+/* doit 함수 선언 */
+void p_doit(int fd);
+
+/* request 헤더 읽기 함수 선언 */
+void p_read_requesthdrs(rio_t *rp, char *hostname, char *port, char *request_header);
+
+/* URI 파싱 함수 선언 */
+void p_parse_uri(char *uri, char *hostname, char *path, char *port);
+
+/* 쓰레드 함수 선언 */
+void *thread(void *vargp);
+
+/* 캐시 초기화 함수 */
+void cache_init();
+
+/* URL에 대한 캐시 찾기 함수 */
+int cache_find(char *url);
+
+/* URI를 캐시에 저장하는 함수 */
+void cache_uri(char *uri, char *buf);
+
+/* Reader Pre 함수 선언 */
+void readerPre(int i);
+
+/* Reader After 함수 선언 */
+void readerAfter(int i);
+
+/* 캐시 블록 구조체 정의 */
+typedef struct
+{
+    char cache_obj[MAX_OBJECT_SIZE];
+    char cache_url[MAXLINE];
+    int LRU;        // least recently used (LRU) priority
+    int isEmpty;    // Indicates if this block is empty
+
+    int readCnt;    // count of readers
+    sem_t wmutex;   // protects accesses to cache
+    sem_t rdcntmutex; // protects accesses to readcnt
+} cache_block;
+
+/* 캐시 구조체 정의 */
+typedef struct
+{
+    cache_block cacheobjs[CACHE_OBJS_COUNT]; // ten cache blocks
+    int cache_num;                           // Cache number (unused)
+} Cache;
+
+/* 전역 캐시 변수 선언 */
+Cache cache;
+
+/* 메인 함수 */
 int main(int argc, char **argv)
 {
-  int listenfd, connfd;
-  char hostname[MAXLINE], port[MAXLINE];
-  socklen_t clientlen;
-  struct sockaddr_storage clientaddr;
+    int listenfd, *clientfd;
+    char hostname[MAXLINE], port[MAXLINE];
+    socklen_t clientlen;
+    struct sockaddr_storage clientaddr;
+    pthread_t tid;
 
-  /* Check command line args */
-  if (argc != 2)
-  {
-    fprintf(stderr, "usage: %s <port>\n", argv[0]);
-    exit(1);
-  }
+    /* 캐시 초기화 */
+    cache_init();
 
-  listenfd = Open_listenfd(argv[1]); // 듣기 소켓을 오픈 -> tiny는 무한 서버루프 실행
-  while (1)
-  {
-    clientlen = sizeof(clientaddr);
-    connfd = Accept(listenfd, (SA *)&clientaddr,
-                    &clientlen); /// 반복적으로 연결 요청 접수
-    Getnameinfo((SA *)&clientaddr, clientlen, hostname, MAXLINE, port, MAXLINE,
-                0);
-    printf("Accepted connection from (%s, %s)\n", hostname, port);
-    doit(connfd);  // 트랜잭션 수행
-    Close(connfd); // 연결을 끊는다
-  }
-}
-
-// 한개의 http트랜잭션을 처리
-void doit(int fd)
-{
-  int is_static;
-  struct stat sbuf;
-  char buf[MAXLINE], method[MAXLINE], uri[MAXLINE], version[MAXLINE];
-  char filename[MAXLINE], cgiargs[MAXLINE];
-  rio_t rio;
-
-  Rio_readinitb(&rio, fd);
-  // 요청 라인을 분석, tiny는 get만지원함.
-  Rio_readlineb(&rio, buf, MAXLINE);
-  printf("Request headers : \n");
-  printf("%s", buf);
-  // sscanf => 문자열에서 데이터를 읽음 scanf=> 표준입력에서 데이터를 읽음
-  sscanf(buf, "%s %s %s", method, uri, version);
-  if (strcasecmp(method, "GET"))
-  {
-    clienterror(fd, method, "501", "Not implemented", "Tiny does not implement this method");
-    return;
-  }
-  read_requesthdrs(&rio);
-
-  is_static = parse_uri(uri, filename, cgiargs);
-  if (stat(filename, &sbuf) < 0)
-  {
-    clienterror(fd, filename, "404", "Not Found", "Tiny couldn`t find this file");
-    return;
-  }
-
-  if (is_static)
-  {
-    // 만일 요청이 정적 컨텐츠를 위한 것이라면, 보통 파일인지, 읽기 권한을 가지고 있는지를 검증
-    if (!(S_ISREG(sbuf.st_mode)) || !(S_IRUSR & sbuf.st_mode))
+    /* 명령행 인자 확인 */
+    if (argc != 2)
     {
-      clienterror(fd, filename, "403", "Forbidden", "Tiny couldn`t read the file");
-      return;
+        fprintf(stderr, "usage: %s <port>\n", argv[0]);
+        exit(1);
     }
-    serve_static(fd, filename, sbuf.st_size);
-  }
-  else
-  {
-    if (!(S_ISREG(sbuf.st_mode)) || !(S_IXUSR & sbuf.st_mode))
+
+    /* SIGPIPE 시그널 무시 */
+    Signal(SIGPIPE, SIG_IGN);
+
+    /* 포트로 대기 소켓 생성 */
+    listenfd = Open_listenfd(argv[1]);
+
+    /* 클라이언트 연결 대기 */
+    while (1)
     {
-      clienterror(fd, filename, "403", "Forbidden", "Tiny couldn`t run the CGI program");
-      return;
+        clientlen = sizeof(clientaddr);
+        clientfd = (int *)Malloc(sizeof(int));
+        *clientfd = Accept(listenfd, (SA *)&clientaddr, &clientlen);
+        Getnameinfo((SA *)&clientaddr, clientlen, hostname, MAXLINE, port, MAXLINE, 0);
+        printf("Accepted connection from (%s, %s)\n", hostname, port);
+        Pthread_create(&tid, NULL, thread, clientfd);
     }
-    serve_dynamic(fd, filename, cgiargs);
-  }
 }
 
-void clienterror(int fd, char *cause, char *errnum, char *shortmsg, char *longmsg)
+/* 쓰레드 함수 */
+void *thread(void *vargp)
 {
-  char buf[MAXLINE], body[MAXBUF];
-
-  sprintf(body, "<html><title>Tiny Error</title>");
-  sprintf(body, "%s<body bgcolor = "
-                "ffffff"
-                ">\r\n",
-          body);
-  sprintf(body, "%s%s: %s\r\n", body, errnum, shortmsg);
-  sprintf(body, "%s<p>%s : %s\r\n", body, longmsg, cause);
-  sprintf(body, "%s<hr><em>The Tiny Web server</em>\r\n", body);
-
-  sprintf(buf, "HTTP/1.0 %s %s\r\n", errnum, shortmsg);
-  Rio_writen(fd, buf, strlen(buf));
-  sprintf(buf, "Content-type: text/html\r\n");
-  Rio_writen(fd, buf, strlen(buf));
-  sprintf(buf, "Content-length: %d\r\n\r\n", (int)strlen(body));
-  Rio_writen(fd, buf, strlen(buf));
-  Rio_writen(fd, body, strlen(body));
+    int clientfd = *((int *)vargp);
+    Pthread_detach((pthread_self()));
+    Free(vargp);
+    p_doit(clientfd);
+    Close(clientfd);
+    return NULL;
 }
 
-void read_requesthdrs(rio_t *rp)
+/* 클라이언트 요청 처리 함수 */
+void p_doit(int clientfd)
 {
-  char buf[MAXLINE];
+    int serverfd;
+    char buf[MAXLINE], method[MAXLINE], uri[MAXLINE], version[MAXLINE], request_header[MAXLINE];
+    char filename[MAXLINE], cgiargs[MAXLINE];
+    char ip[MAXLINE], port[MAXLINE], hostname[MAXLINE], path[MAXLINE], header[MAXLINE];
+    rio_t rio, server_rio;
+    int len;
 
-  Rio_readlineb(rp, buf, MAXLINE);
-  while (strcmp(buf, "\r\n"))
-  {
-    Rio_readlineb(rp, buf, MAXLINE);
-    printf("%s", buf);
-  }
-  return;
-}
+    /* 요청 라인 및 헤더 읽기 */
+    Rio_readinitb(&rio, clientfd);
+    Rio_readlineb(&rio, request_header, MAXLINE);
+    printf("1. Request headers:\n");
+    printf("%s", request_header);
+    sscanf(request_header, "%s %s", method, uri);
 
-int parse_uri(char *uri, char *filename, char *cgiargs)
-{
-  char *ptr;
-  printf("3242342342342342\n\r");
-  if (!strstr(uri, "cgi-bin"))
-  {
-    strcpy(cgiargs, "");
-    strcpy(filename, ".");
-    strcat(filename, uri);
-    if (uri[strlen(uri) - 1] == '/')
+    char url_store[MAXLINE];
+    strcpy(url_store, uri); // 연결 소켓이 들고 있는 URI를 복사합니다.
+
+    /* 캐시에서 URI 찾기 */
+    int cache_index;
+    if ((cache_index = cache_find(url_store)) != -1)
     {
-      strcat(filename, "home.html");
+        readerPre(cache_index); // 캐시 읽기 뮤텍스 락
+        Rio_writen(clientfd, cache.cacheobjs[cache_index].cache_obj, strlen(cache.cacheobjs[cache_index].cache_obj));
+        readerAfter(cache_index); // 캐시 읽기 뮤텍스 언락
+        return;
     }
-    printf("------------------>>>>>>ttttt%s", uri);
-    return 1;
-  }
-  else
-  {
-    printf("------------------>>>>>>%s", uri);
-    ptr = index(uri, '?');
-    if (ptr)
+
+    p_parse_uri(uri, hostname, path, port);
+
+    sprintf(request_header, "%s /%s %s\r\n", method, path, "HTTP/1.0");
+    sprintf(request_header, "%sConnection: close\r\n", request_header);
+    sprintf(request_header, "%sProxy-Connection: close\r\n", request_header);
+    sprintf(request_header, "%s%s\r\n", request_header, user_agent_hdr);
+
+    printf("\n%s %s %s\n", hostname, port, path);
+    printf("%s", request_header);
+
+    serverfd = Open_clientfd(hostname, port);
+    Rio_readinitb(&server_rio, serverfd);
+    Rio_writen(serverfd, request_header, strlen(request_header));
+
+    char cachebuf[MAX_OBJECT_SIZE];
+    int sizebuf = 0;
+    size_t n;
+
+    /* 서버 응답 읽고 클라이언트에 전송 */
+    while ((n = Rio_readlineb(&server_rio, buf, MAXLINE)) != 0)
     {
-      strcpy(cgiargs, ptr + 1);
-      *ptr = '\0';
+        sizebuf += n;
+        if (sizebuf < MAX_OBJECT_SIZE)
+            strcat(cachebuf, buf);
+        Rio_writen(clientfd, buf, n);
+    }
+
+    Close(serverfd);
+
+    /* 캐시에 저장 */
+    if (sizebuf < MAX_OBJECT_SIZE)
+    {
+        cache_uri(url_store, cachebuf);
+    }
+}
+
+/* URI 파싱 함수 */
+void p_parse_uri(char *uri, char *hostname, char *path, char *port)
+{
+    char *ptr = strstr(uri, "//");
+    ptr = ptr != NULL ? ptr + 2 : uri;
+
+    char *host_end = strchr(ptr, ':');
+    if (host_end == NULL)
+    {
+        host_end = strchr(ptr, '/');
+    }
+
+    int len = host_end - ptr;
+    strncpy(hostname, ptr, len);
+    hostname[len] = '\0';
+
+    if (*host_end == ':')
+    {
+        char *port_start = host_end + 1;
+        char *path_start = strchr(port_start, '/');
+        if (path_start == NULL)
+        {
+            printf("Invalid URI\n");
+            exit(1);
+        }
+        len = path_start - port_start;
+        strncpy(port, port_start, len);
+        port[len] = '\0';
+    }
+
+    char *path_start = strchr(ptr, '/');
+    if (path_start != NULL)
+    {
+        strcpy(path, path_start);
     }
     else
     {
-      strcpy(cgiargs, "");
+        strcpy(path, "/");
     }
-    strcpy(filename, ".");
-    strcat(filename, uri);
-    return 0;
-  }
 }
 
-void serve_static(int fd, char *filename, int filesize)
+/* 요청 헤더 읽기 함수 */
+void p_read_requesthdrs(rio_t *rp, char *hostname, char *port, char *request_header)
 {
-  int srcfd;
-  char *srcp, filetype[MAXLINE], buf[MAXBUF];
+    char buf[MAXLINE];
+    Rio_readlineb(rp, buf, MAXLINE);
 
-  get_filetype(filename, filetype);
-  sprintf(buf, "HTTP/1.0 OK\r\n");
-  sprintf(buf, "%sServer: Tiny Web Server\r\n", buf);
-  sprintf(buf, "%sConnection: close\r\n", buf);
-  sprintf(buf, "%sContent-length: %d\r\n", buf, filesize);
-  sprintf(buf, "%sContent-type: %s\r\n\r\n", buf, filetype);
-  Rio_writen(fd, buf, strlen(buf));
-  printf("Response headers:\n");
-  printf("%s", buf);
-
-  srcfd = Open(filename, O_RDONLY, 0);
-  srcp = Mmap(0, filesize, PROT_READ, MAP_PRIVATE, srcfd, 0);
-  Close(srcfd);
-  Rio_writen(fd, srcp, filesize);
-  Munmap(srcp, filesize);
+    while (strcmp(buf, "\r\n"))
+    {
+        if (strstr(buf, "User-Agent:") == buf)
+        {
+            char user_agent_buf[MAXLINE];
+            snprintf(user_agent_buf, MAXLINE, user_agent_hdr);
+            strcpy(request_header, user_agent_buf);
+        }
+        Rio_readlineb(rp, buf, MAXLINE);
+        strcat(request_header, buf);
+    }
+    return;
 }
 
-void get_filetype(char *filename, char *filetype)
+/* 캐시 초기화 함수 */
+void cache_init()
 {
-  if (strstr(filename, ".html"))
-  {
-    strcpy(filetype, "text/html");
-  }
-  else if (strstr(filename, ".gif"))
-  {
-    strcpy(filetype, "image/gif");
-  }
-  else if (strstr(filename, ".png"))
-  {
-    strcpy(filetype, "image/png");
-  }
-  else if (strstr(filename, ".jpg"))
-  {
-    strcpy(filetype, "image/jpeg");
-  }
-  else
-  {
-    strcpy(filetype, "text/plain");
-  }
+    cache.cache_num = 0;
+    int i;
+    for (i = 0; i < CACHE_OBJS_COUNT; i++)
+    {
+        cache.cacheobjs[i].LRU = 0;
+        cache.cacheobjs[i].isEmpty = 1;
+        Sem_init(&cache.cacheobjs[i].wmutex, 0, 1);
+        Sem_init(&cache.cacheobjs[i].rdcntmutex, 0, 1);
+        cache.cacheobjs[i].readCnt = 0;
+    }
 }
 
-void serve_dynamic(int fd, char *filename, char *cgiargs)
+/* Reader Pre 함수 */
+void readerPre(int i)
 {
-  char buf[MAXLINE], *emptylist[] = {NULL};
+    P(&cache.cacheobjs[i].rdcntmutex);
+    cache.cacheobjs[i].readCnt++;
+    if (cache.cacheobjs[i].readCnt == 1)
+        P(&cache.cacheobjs[i].wmutex);
+    V(&cache.cacheobjs[i].rdcntmutex);
+}
 
-  sprintf(buf, "HTTP/1.0 200 OK\r\n");
-  Rio_writen(fd, buf, strlen(buf));
-  sprintf(buf, "Server: Tiny Web Server\r\n");
-  Rio_writen(fd, buf, strlen(buf));
+/* Reader After 함수 */
+void readerAfter(int i)
+{
+    P(&cache.cacheobjs[i].rdcntmutex);
+    cache.cacheobjs[i].readCnt--;
+    if (cache.cacheobjs[i].readCnt == 0)
+        V(&cache.cacheobjs[i].wmutex);
+    V(&cache.cacheobjs[i].rdcntmutex);
+}
 
-  if (Fork() == 0)
-  {
-    setenv("QUERY_STRING", cgiargs, 1);
-    Dup2(fd, STDOUT_FILENO);
-    Execve(filename, emptylist, environ);
-  }
-  Wait(NULL);
+/* 캐시 찾기 함수 */
+int cache_find(char *url)
+{
+    int i;
+    for (i = 0; i < CACHE_OBJS_COUNT; i++)
+    {
+        readerPre(i);
+        if (cache.cacheobjs[i].isEmpty == 0 && strcmp(url, cache.cacheobjs[i].cache_url) == 0)
+        {
+            readerAfter(i);
+            return i;
+        }
+        readerAfter(i);
+    }
+    return -1;
+}
+
+/* 캐시 쫓아내기 함수 */
+int cache_eviction()
+{
+    int min = LRU_MAGIC_NUMBER;
+    int minindex = 0;
+    int i;
+    for (i = 0; i < CACHE_OBJS_COUNT; i++)
+    {
+        readerPre(i);
+        if (cache.cacheobjs[i].isEmpty == 1)
+        {
+            minindex = i;
+            readerAfter(i);
+            break;
+        }
+        if (cache.cacheobjs[i].LRU < min)
+        {
+            minindex = i;
+            min = cache.cacheobjs[i].LRU;
+            readerAfter(i);
+            continue;
+        }
+        readerAfter(i);
+    }
+    return minindex;
+}
+
+/* Writer Pre 함수 */
+void writePre(int i)
+{
+    P(&cache.cacheobjs[i].wmutex);
+}
+
+/* Writer After 함수 */
+void writeAfter(int i)
+{
+    V(&cache.cacheobjs[i].wmutex);
+}
+
+/* LRU 업데이트 함수 */
+void cache_LRU(int index)
+{
+    int i;
+    for (i = 0; i < CACHE_OBJS_COUNT; i++)
+    {
+        if (i == index)
+        {
+            continue;
+        }
+        writePre(i);
+        if (cache.cacheobjs[i].isEmpty == 0)
+        {
+            cache.cacheobjs[i].LRU--;
+        }
+        writeAfter(i);
+    }
+}
+
+/* URI 및 내용 캐싱 함수 */
+void cache_uri(char *uri, char *buf)
+{
+    int i = cache_eviction();
+
+    writePre(i);
+
+    strcpy(cache.cacheobjs[i].cache_obj, buf);
+    strcpy(cache.cacheobjs[i].cache_url, uri);
+    cache.cacheobjs[i].isEmpty = 0;
+    cache.cacheobjs[i].LRU = LRU_MAGIC_NUMBER;
+    cache_LRU(i);
+
+    writeAfter(i);
 }

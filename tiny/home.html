@@ -6,8 +6,21 @@
 
 <body>
     <img align="middle" src="godzilla.gif">
+    <video controls width="250">
+        <source src="sample.mp4" type="video/mp4" />
+    </video>
     Dave O'Hallaron
-    <img align="middle" src="godzilla.jpg">
+    <input type="text" id="value1">
+    <input type="text" id="value2">
+    <button onclick="sendGetRequest()">Submit</button>
+    <script>
+        function sendGetRequest() {
+            var value1 = document.getElementById("value1").value;
+            var value2 = document.getElementById("value2").value;
+            var url = "/cgi-bin/adder?" + value1 + "&" + value2;
+            location.href = url;
+        }
+    </script>
 </body>
 
 </html>

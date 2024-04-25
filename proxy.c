@@ -2,19 +2,21 @@
 #include "csapp.h"
 
 /* Recommended max cache and object sizes */
-#define MAX_CACHE_SIZE 1049000
-#define MAX_OBJECT_SIZE 102400
-#define LRU_MAGIC_NUMBER 9999
-#define N 4
-#define CACHE_OBJS_COUNT 10
+#define MAX_CACHE_SIZE 1049000 // 캐시 및 객체의 최대 크기
+#define MAX_OBJECT_SIZE 102400 // 객체의 최대 크기
+#define LRU_MAGIC_NUMBER 9999  // LRU 알고리즘에 사용되는 매직 넘버
+#define CACHE_OBJS_COUNT 10    // 캐시 객체의 수
 
 /* User-Agent 헤더 */
 static const char *user_agent_hdr =
     "User-Agent: Mozilla/5.0 (X11; Linux x86_64; rv:10.0.3) Gecko/20120305 "
-    "Firefox/10.0.3\r\n";
+    "Firefox/10.0.3\r\n"; // 브라우저 정보 헤더
 
 /* doit 함수 선언 */
 void p_doit(int fd);
+
+/* request 헤더 읽기 함수 선언 */
+void p_read_requesthdrs(rio_t *rp, char *hostname, char *port, char *request_header);
 
 /* URI 파싱 함수 선언 */
 void p_parse_uri(char *uri, char *hostname, char *path, char *port);
@@ -60,61 +62,53 @@ typedef struct
 /* 전역 캐시 변수 선언 */
 Cache cache;
 
-/* 메인 함수 */
 int main(int argc, char **argv)
 {
-  int listenfd, *clientfd;
-  char hostname[MAXLINE], port[MAXLINE];
-  socklen_t clientlen;
-  struct sockaddr_storage clientaddr;
-  pthread_t tid;
+  int listenfd, *clientfd;               // 소켓 및 클라이언트 파일 디스크립터 변수 선언
+  char hostname[MAXLINE], port[MAXLINE]; // 호스트명 및 포트 문자열 배열 선언
+  socklen_t clientlen;                   // 클라이언트 주소 길이 변수
+  struct sockaddr_storage clientaddr;    // 클라이언트 주소 구조체
+  pthread_t tid;                         // 스레드 ID 변수 선언
 
   /* 캐시 초기화 */
-  cache_init();
+  cache_init(); // 캐시 초기화 함수 호출
 
   /* 명령행 인자 확인 */
-  if (argc != 2)
+  if (argc != 2) // 명령행 인자 개수 확인
   {
-    fprintf(stderr, "usage: %s <port>\n", argv[0]);
-    exit(1);
+    fprintf(stderr, "usage: %s <port>\n", argv[0]); // 사용법 출력
+    exit(1);                                        // 프로그램 종료
   }
 
   /* SIGPIPE 시그널 무시 */
-  Signal(SIGPIPE, SIG_IGN);
+  Signal(SIGPIPE, SIG_IGN); // SIGPIPE 시그널 무시 설정
 
   /* 포트로 대기 소켓 생성 */
-  listenfd = Open_listenfd(argv[1]);
+  listenfd = Open_listenfd(argv[1]); // 지정된 포트로 소켓 열기
 
   /* 클라이언트 연결 대기 */
-  while (1)
+  while (1) // 무한 루프
   {
-    clientlen = sizeof(clientaddr);
-    clientfd = (int *)Malloc(sizeof(int));
-    *clientfd = Accept(listenfd, (SA *)&clientaddr, &clientlen);
-    Getnameinfo((SA *)&clientaddr, clientlen, hostname, MAXLINE, port, MAXLINE, 0);
-    printf("Accepted connection from (%s, %s)\n", hostname, port);
-    Pthread_create(&tid, NULL, thread, clientfd);
+    clientlen = sizeof(clientaddr);                                                 // 클라이언트 주소 길이 설정
+    clientfd = (int *)Malloc(sizeof(int));                                          // 클라이언트 파일 디스크립터 동적 할당
+    *clientfd = Accept(listenfd, (SA *)&clientaddr, &clientlen);                    // 클라이언트 연결 수락
+    Getnameinfo((SA *)&clientaddr, clientlen, hostname, MAXLINE, port, MAXLINE, 0); // 클라이언트 호스트명 및 포트 추출
+    printf("Accepted connection from (%s, %s)\n", hostname, port);                  // 연결 수락 메시지 출력
+    Pthread_create(&tid, NULL, thread, clientfd);                                   // 새 스레드 생성 및 실행
   }
 }
 
 /* 쓰레드 함수 */
 void *thread(void *vargp)
 {
-  // 클라이언트 소켓 파일 디스크립터를 int 형식으로 형변환하여 가져옵니다.
   int clientfd = *((int *)vargp);
-  // 쓰레드 분리를 위해 pthread_detach 함수를 호출합니다.
   Pthread_detach((pthread_self()));
-  // 클라이언트 소켓 파일 디스크립터를 동적으로 할당된 메모리에서 해제합니다.
   Free(vargp);
-  // p_doit 함수를 호출하여 클라이언트와의 통신을 수행합니다.
   p_doit(clientfd);
-  // 클라이언트 소켓을 닫습니다.
   Close(clientfd);
-  // 스레드 함수 종료를 나타내는 NULL 포인터를 반환합니다.
   return NULL;
 }
 
-/* 클라이언트 요청 처리 함수 */
 /* 클라이언트 요청 처리 함수 */
 void p_doit(int clientfd)
 {
@@ -406,10 +400,10 @@ void cache_uri(char *uri, char *buf)
   writePre(i);
 
   // 캐시에 URI와 응답을 저장합니다.
-  strcpy(cache.cacheobjs[i].cache_obj, buf);
-  strcpy(cache.cacheobjs[i].cache_url, uri);
-  cache.cacheobjs[i].isEmpty = 0;
-  cache.cacheobjs[i].LRU = LRU_MAGIC_NUMBER;
+  strcpy(cache.cacheobjs[i].cache_obj, buf); // 응답 내용을 캐시 객체에 복사합니다.
+  strcpy(cache.cacheobjs[i].cache_url, uri); // URI를 캐시 객체에 복사합니다.
+  cache.cacheobjs[i].isEmpty = 0;            // 캐시 객체가 비어있지 않음을 표시합니다.
+  cache.cacheobjs[i].LRU = LRU_MAGIC_NUMBER; // LRU 값을 설정합니다.
   // LRU 업데이트 함수를 호출하여 LRU 값을 갱신합니다.
   cache_LRU(i);
 
